@@ -2,13 +2,6 @@ use std::num::ParseIntError;
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum TokenType {
-    LeftParen,    // x
-    RightParen,   // x
-    LeftBrace,    // x
-    RightBrace,   // x
-    RightBracket, // x
-    LeftBracket,  // x
-
     Comma,
     Dot,
     DotDot,
@@ -35,6 +28,7 @@ pub enum TokenType {
     SingleQuotedString(String), // x
     VariableExpansion(String),
     SubshellExpansion(Option<Vec<Token>>),
+    ProcessSubstitution(Option<Vec<Token>>),
     Integer(i64),
     Float(f32),
     RangeExpressionNumeric(i64, i64, Option<i64>),
@@ -96,58 +90,77 @@ impl Scanner {
     fn scan_token(&mut self) {
         if let Some(c) = self.next_char() {
             match c {
-                '(' => self.add_token(TokenType::LeftParen),
-                ')' => self.add_token(TokenType::RightParen),
-                '[' => self.add_token(TokenType::LeftBracket),
-                ']' => self.add_token(TokenType::RightBracket),
+                '(' => {
+                    self.parse_subshell_expansion();
+                }
+                // ')' => self.add_token(TokenType::RightParen),
+                // '[' => self.add_token(TokenType::LeftBracket),
+                // ']' => self.add_token(TokenType::RightBracket),
                 '{' => {
                     self.parse_range_expression();
                 }
-                '}' => self.add_token(TokenType::RightBrace),
+                // '}' => self.add_token(TokenType::RightBrace),
                 ',' => self.add_token(TokenType::Comma),
                 '+' => self.add_token(TokenType::Plus),
                 ';' => self.add_token(TokenType::Semicolon),
                 '|' => self.add_token(TokenType::Pipe),
                 '$' => {
-                    if self.peek().is_some_and(|c| c == '(') {
+                    if self.peek_next().is_some_and(|c| c == '(') {
+                        self.increment_n(2); // get rid of $
                         self.parse_subshell_expansion();
-                    } else if self.peek().is_some_and(|c| c == '{') {
-                        self.increment_current(); // get rid of $
-                        self.parse_variable(); // passed will be {something}
-                        self.increment_current(); // get rid of trailing }
-                    } else if self.peek().is_some_and(|c| allowed_name_char(c)) {
+                    } else if self.peek_next().is_some_and(|c| c == '{') {
+                        self.increment_n(2); // get rid of ${
+                        self.parse_variable(); // passed will be something}
+                        self.increment(); // get rid of trailing }
+                    } else if self.peek_next().is_some_and(|c| allowed_name_char(c)) {
+                        self.increment();
                         self.parse_variable();
                     } else {
                         self.emit_error(" expand what?");
                     }
                 }
-                '<' => self.add_token(TokenType::InputRedirect),
+                '<' => {
+                    if self.peek_next().is_some_and(|c| c == '(') {
+                        self.increment(); // look at '('
+                        self.start = self.current;
+                        let expansion = self.parse_expansion();
+                        self.add_token(TokenType::ProcessSubstitution(expansion));
+                    } else {
+                        self.add_token(TokenType::InputRedirect)
+                    }
+                }
                 '\\' => self.add_token(TokenType::Backslash),
                 '/' => self.add_token(TokenType::Forwardslash),
-                '\t' | '\n' | 'r' | ' ' => return,
+                '\t' | '\n' | 'r' | ' ' => {
+                    self.increment();
+                    return;
+                }
                 '"' => {
-                    while self.peek().is_some_and(|c| c != '"') {
-                        self.increment_current();
-                        if self.peek().is_none() {
+                    while self.peek_next().is_some_and(|c| c != '"') {
+                        self.increment();
+                        if self.peek_next().is_none() {
                             self.emit_error("Unterminated string literal");
                         }
                     }
                     self.add_token(TokenType::DoubleQuotedString(
-                        self.source[self.start + 1..self.current].to_string(),
+                        self.source[self.start + 1..self.current + 1].to_string(),
                     ));
-                    self.increment_current();
+                    // let scanner =
+                    //     Scanner::new(self.source[self.start + 1..self.current + 1].to_string());
+                    // self.add_token(TokenType::StringExpansion(scanner.get_tokens()));
+                    self.increment();
                 }
                 '\'' => {
-                    while self.peek().is_some_and(|c| c != '\'') {
-                        self.increment_current();
-                        if self.peek().is_none() {
+                    while self.peek_next().is_some_and(|c| c != '\'') {
+                        self.increment();
+                        if self.peek_next().is_none() {
                             self.emit_error("Unterminated string literal");
                         }
                     }
                     self.add_token(TokenType::SingleQuotedString(
-                        self.source[self.start + 1..self.current].to_string(),
+                        self.source[self.start + 1..self.current + 1].to_string(),
                     ));
-                    self.increment_current();
+                    self.increment();
                 }
                 '*' => {
                     if self.peek().is_some_and(|c| c.is_whitespace()) {
@@ -160,7 +173,7 @@ impl Scanner {
                 '#' => {
                     if self.peek().is_some_and(|c| c == '!') {
                         self.add_token(TokenType::Shebang);
-                        self.increment_current();
+                        self.increment();
                     } else {
                         self.add_token(TokenType::Pound);
                     }
@@ -177,17 +190,19 @@ impl Scanner {
                 }
 
                 '.' => {
-                    if self.peek().is_some_and(|c| c == '.') {
-                        if self.peek_next().is_some_and(|c| c.is_whitespace())
-                            || self.peek_next().is_none()
+                    if self.peek_next().is_some_and(|c| c == '.') {
+                        if self.peek_nth(2).is_some_and(|c| c.is_whitespace())
+                            || self.peek_nth(2).is_none()
                         {
                             self.add_token(TokenType::DotDot);
-                            self.increment_current();
+                            self.increment();
                         } else {
                             self.parse_word();
                         }
                     } else {
-                        if self.peek().is_some_and(|c| c.is_whitespace()) || self.peek().is_none() {
+                        if self.peek_next().is_some_and(|c| c.is_whitespace())
+                            || self.peek().is_none()
+                        {
                             self.add_token(TokenType::Dot);
                         } else {
                             self.parse_word();
@@ -195,7 +210,13 @@ impl Scanner {
                     }
                 }
                 '=' => {
-                    if self.peek().is_some_and(|c| c.is_whitespace())
+                    println!(
+                        "current \'{:?}\' next \'{:?}\' prev\'{:?}\'",
+                        self.peek(),
+                        self.peek_next(),
+                        self.peek_prev()
+                    );
+                    if self.peek_next().is_some_and(|c| c.is_whitespace())
                         || self.peek_prev().is_some_and(|c| c.is_whitespace())
                     {
                         self.emit_error(" whitespace around equals");
@@ -208,9 +229,9 @@ impl Scanner {
                     }
                 }
                 '>' => {
-                    if self.peek().is_some_and(|c| c == '>') {
+                    if self.peek_next().is_some_and(|c| c == '>') {
                         self.add_token(TokenType::AppendRedirect);
-                        self.increment_current();
+                        self.increment();
                     } else {
                         self.add_token(TokenType::OutputRedirect);
                     }
@@ -235,17 +256,17 @@ impl Scanner {
                     }
                 }
             }
+            self.increment();
         }
     }
     fn emit_error(&mut self, message: &str) {
         self.had_error = true;
-        let space = " ".repeat(self.current - 1);
+        let space = " ".repeat(self.current);
         eprintln!("{}", self.source);
         eprintln!("{}\x1b[;31m^{}\x1b[;37m", space, message);
     }
     pub fn next_char(&mut self) -> Option<char> {
         let ret = self.source.chars().nth(self.current);
-        self.increment_current();
         ret
     }
     pub fn peek(&self) -> Option<char> {
@@ -258,6 +279,13 @@ impl Scanner {
             self.source.chars().nth(self.current - 1)
         }
     }
+    pub fn peek_nth(&self, n: usize) -> Option<char> {
+        if self.current + n > self.source.len() {
+            None
+        } else {
+            self.source.chars().nth(self.current + n)
+        }
+    }
     pub fn peek_next(&self) -> Option<char> {
         self.source.chars().nth(self.current + 1)
     }
@@ -265,7 +293,7 @@ impl Scanner {
         while self.peek().is_some_and(|c| {
             !c.is_whitespace() && !is_pair_delimiter(c) && !is_special_character(c)
         }) {
-            self.increment_current()
+            self.increment()
         }
         if self.source[self.start..self.current].contains('*') {
             self.add_token(TokenType::GlobbedWord(
@@ -278,14 +306,48 @@ impl Scanner {
         }
     }
     fn parse_variable(&mut self) {
-        while self.peek().is_some_and(|c| allowed_name_char(c)) {
-            self.increment_current();
+        self.start = self.current;
+        while self.peek_next().is_some_and(|c| allowed_name_char(c)) {
+            self.increment();
         }
         self.add_token(TokenType::VariableExpansion(
-            self.source[self.start + 1..self.current].to_string(),
+            self.source[self.start..self.current + 1].to_string(),
         ));
     }
+    fn parse_expansion(&mut self) -> Option<Vec<Token>> {
+        if let Some(pair_close) = get_pair_match(self.peek().unwrap()) {
+            let pair_open = self.peek().unwrap();
+            let mut paren_stack: Vec<char> = vec![];
 
+            while self.peek().is_some() {
+                if self.peek().unwrap() == pair_open {
+                    paren_stack.push(pair_open);
+                } else if self.peek().unwrap() == pair_close {
+                    if let Some(&top) = paren_stack.last() {
+                        if top == pair_open {
+                            paren_stack.pop();
+                        }
+                    }
+                }
+                if paren_stack.is_empty() {
+                    break;
+                }
+
+                self.increment();
+            }
+            if !paren_stack.is_empty() {
+                self.emit_error(" unmatched pair");
+                None
+            } else {
+                println!("{}", self.source[self.start + 1..self.current].to_string());
+                let scanner = Scanner::new(self.source[self.start + 1..self.current].to_string());
+                self.increment();
+                scanner.get_tokens()
+            }
+        } else {
+            None
+        }
+    }
     fn parse_subshell_expansion(&mut self) {
         if let Some(pair_close) = get_pair_match(self.peek().unwrap()) {
             let pair_open = self.peek().unwrap();
@@ -305,21 +367,21 @@ impl Scanner {
                     break;
                 }
 
-                self.increment_current();
+                self.increment();
             }
             if !paren_stack.is_empty() {
                 self.emit_error(" unmatched pair");
             } else {
-                println!("{}", self.source[self.start + 2..self.current].to_string());
-                let scanner = Scanner::new(self.source[self.start + 2..self.current].to_string());
+                println!("{}", self.source[self.start + 1..self.current].to_string());
+                let scanner = Scanner::new(self.source[self.start + 1..self.current].to_string());
                 self.add_token(TokenType::SubshellExpansion(scanner.get_tokens()));
             }
-            self.increment_current();
+            self.increment();
         }
     }
     fn parse_number(&mut self) {
         while self.peek().is_some_and(|c| c.is_numeric()) {
-            self.increment_current()
+            self.increment()
         }
 
         if self.peek().is_some_and(|c| c.is_alphabetic()) {
@@ -329,9 +391,9 @@ impl Scanner {
             .peek()
             .is_some_and(|c| c == '.' && self.peek_next().is_some_and(|c| c.is_numeric()))
         {
-            self.increment_current();
+            self.increment();
             while self.peek().is_some_and(|c| c.is_numeric()) {
-                self.increment_current()
+                self.increment()
             }
             let num = self.source[self.start..self.current]
                 .parse::<f32>()
@@ -350,7 +412,7 @@ impl Scanner {
     fn parse_and_get_integer(&mut self) -> Result<i64, ParseIntError> {
         self.start = self.current;
         while self.peek().is_some_and(|c| c.is_numeric()) {
-            self.increment_current();
+            self.increment();
         }
         if self.current < self.source.len() {
             self.source[self.start..self.current].parse()
@@ -360,14 +422,15 @@ impl Scanner {
     }
 
     fn parse_range_expression(&mut self) {
-        if self.peek().is_some_and(|c| c.is_numeric()) {
+        if self.peek_next().is_some_and(|c| c.is_numeric()) {
+            self.increment();
             // we are parsing a RangeExpressionNumeric
             let start = self.parse_and_get_integer();
-            if self.peek().is_some_and(|c| c != '.') && self.peek_next().is_some_and(|c| c != '.') {
+            if self.peek().is_some_and(|c| c == '.') && self.peek_next().is_some_and(|c| c == '.') {
+                self.increment_n(2);
+            } else {
                 self.emit_error("range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
                 return;
-            } else {
-                self.increment_n(2);
             }
             let end = self.parse_and_get_integer();
 
@@ -382,15 +445,15 @@ impl Scanner {
                     end.unwrap(),
                     None,
                 ));
-                self.increment_current();
                 return;
             }
 
-            if self.peek().is_some_and(|c| c != '.') && self.peek_next().is_some_and(|c| c != '.') {
+            if self.peek().is_some_and(|c| c == '.') && self.peek_next().is_some_and(|c| c == '.') {
+                self.increment_n(2);
+            } else {
                 self.emit_error("range expressions can take the form {i..i}, {a..a}, {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
                 return;
             }
-            self.increment_n(2);
 
             let by;
             if self.peek().is_some_and(|c| c.is_numeric()) {
@@ -398,48 +461,57 @@ impl Scanner {
                 if by.is_err() {
                     self.emit_error(" error parsing range expressions");
                     return;
-                } else {
+                }
+                if self.peek().is_some_and(|c| c == '}') {
                     self.add_token(TokenType::RangeExpressionNumeric(
                         start.unwrap(),
                         end.unwrap(),
                         Some(by.unwrap()),
                     ));
-                    self.increment_current();
+                    return;
+                } else {
+                    self.emit_error("range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
+                    self.increment();
                     return;
                 }
             } else {
-                self.increment_current();
                 self.emit_error("range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
+                self.increment();
                 return;
             }
-        } else if self.peek().is_some_and(|c| c.is_alphabetic()) {
+        } else if self.peek_next().is_some_and(|c| c.is_alphabetic()) {
             // we are parsing a RangeExpressionAlphabetic
+            self.increment();
             let start = self.peek().unwrap();
-            if self.peek().is_some_and(|c| c != '.') && self.peek_next().is_some_and(|c| c != '.') {
+            self.increment();
+
+            if self.peek().is_some_and(|c| c == '.') && self.peek_next().is_some_and(|c| c == '.') {
+                self.increment_n(2);
+            } else {
                 self.emit_error("must have \'..\', range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
                 return;
             }
-            self.increment_n(3);
+
             let end: char;
             if self.peek().is_some_and(|c| c.is_alphabetic()) {
                 end = self.peek().unwrap();
+                self.increment(); // on second alpha
             } else {
                 self.emit_error("range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
                 return;
             }
-            self.increment_current(); // on second alpha
 
             if self.peek().is_some_and(|c| c == '}') {
                 self.add_token(TokenType::RangeExpressionAlphabetic(start, end, None));
-                self.increment_current();
                 return;
-            }
-
-            if self.peek().is_some_and(|c| c != '.') && self.peek_next().is_some_and(|c| c != '.') {
+            } else if self.peek().is_some_and(|c| c == '.')
+                && self.peek_next().is_some_and(|c| c == '.')
+            {
+                self.increment_n(2);
+            } else {
                 self.emit_error("must have \'..\', range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
                 return;
             }
-            self.increment_n(2);
 
             let by;
             if self.peek().is_some_and(|c| c.is_numeric()) {
@@ -453,12 +525,11 @@ impl Scanner {
                         end,
                         Some(by.unwrap()),
                     ));
-                    self.increment_current();
                     return;
                 }
             } else {
-                self.increment_current();
                 self.emit_error("range expressions can take the form {i..i..i} or {a..a..i} (where \'i\' is an integer, and \'a\' is a character)");
+                self.increment();
                 return;
             }
         } else {
@@ -470,7 +541,7 @@ impl Scanner {
         self.tokens.push(Token::new(tok_type));
     }
 
-    fn increment_current(&mut self) {
+    fn increment(&mut self) {
         self.current = self.current + 1;
     }
 
@@ -485,12 +556,6 @@ pub fn is_pair_delimiter(c: char) -> bool {
         _ => false,
     }
 }
-pub fn is_group_opener(c: char) -> bool {
-    match c {
-        '(' | '{' | '[' => true,
-        _ => false,
-    }
-}
 pub fn get_pair_match(c: char) -> Option<char> {
     match c {
         '(' => Some(')'),
@@ -500,12 +565,6 @@ pub fn get_pair_match(c: char) -> Option<char> {
         '}' => Some('{'),
         ']' => Some('{'),
         _ => None,
-    }
-}
-pub fn is_group_closer(c: char) -> bool {
-    match c {
-        ')' | '}' | ']' => true,
-        _ => false,
     }
 }
 pub fn is_special_character(c: char) -> bool {
@@ -521,27 +580,6 @@ pub fn allowed_name_char(c: char) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[test]
-    fn get_char() {
-        let mut scan = Scanner::new("abcdef".to_string());
-        assert_eq!(scan.next_char(), Some('a'));
-        assert_eq!(scan.next_char(), Some('b'));
-        assert_eq!(scan.next_char(), Some('c'));
-        assert_eq!(scan.next_char(), Some('d'));
-        assert_eq!(scan.next_char(), Some('e'));
-        assert_eq!(scan.next_char(), Some('f'));
-    }
-    #[test]
-    fn single_char_tokens() {
-        let scan = Scanner::new("(".to_string());
-        let expected = vec![Token::new(TokenType::LeftParen), Token::new(TokenType::EOF)];
-        assert_eq!(Some(expected), scan.get_tokens());
-    }
-    #[test]
-    fn two_char_tokens() {
-        let scan = Scanner::new("==".to_string());
-        assert_eq!(None, scan.get_tokens());
-    }
 
     #[test]
     fn float() {
@@ -766,6 +804,65 @@ mod test {
             Token::new(TokenType::EOF),
         ];
         assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("{1..2..3}".to_string());
+        let expected = vec![
+            Token::new(TokenType::RangeExpressionNumeric(1, 2, Some(3))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("{1..2..a}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{a..2}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{1..a}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{1.a}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{1.2}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{1..2..3".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{1..2.3}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{a..a..a}".to_string());
+        assert_eq!(None, scan.get_tokens());
+
+        let scan = Scanner::new("{a..b}".to_string());
+        let expected = vec![
+            Token::new(TokenType::RangeExpressionAlphabetic('a', 'b', None)),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("{a..z}".to_string());
+        let expected = vec![
+            Token::new(TokenType::RangeExpressionAlphabetic('a', 'z', None)),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("{a..z..1}".to_string());
+        let expected = vec![
+            Token::new(TokenType::RangeExpressionAlphabetic('a', 'z', Some(1))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("{a..z..10}".to_string());
+        let expected = vec![
+            Token::new(TokenType::RangeExpressionAlphabetic('a', 'z', Some(10))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
     }
 
     #[test]
@@ -829,10 +926,198 @@ mod test {
             Token::new(TokenType::EOF),
         ];
         assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("awk '{print $1}' data.txt | sort | uniq -c".to_string());
+        let expected = vec![
+            Token::new(TokenType::Word("awk".to_string())),
+            Token::new(TokenType::SingleQuotedString("{print $1}".to_string())),
+            Token::new(TokenType::Word("data.txt".to_string())),
+            Token::new(TokenType::Pipe),
+            Token::new(TokenType::Word("sort".to_string())),
+            Token::new(TokenType::Pipe),
+            Token::new(TokenType::Word("uniq".to_string())),
+            Token::new(TokenType::Word("-c".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+    }
+
+    #[test]
+    fn subshell_expansion() {
+        let scan = Scanner::new("(grep (ls -a | head -n1))".to_string());
+        let inner = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-a".to_string())),
+            Token::new(TokenType::Pipe),
+            Token::new(TokenType::Word("head".to_string())),
+            Token::new(TokenType::Word("-n1".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let outer = vec![
+            Token::new(TokenType::Word("grep".to_string())),
+            Token::new(TokenType::SubshellExpansion(Some(inner))),
+            Token::new(TokenType::EOF),
+        ];
+        let expected = vec![
+            Token::new(TokenType::SubshellExpansion(Some(outer))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("(grep (ls -a | head -n1))".to_string());
+        let inner = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-a".to_string())),
+            Token::new(TokenType::Pipe),
+            Token::new(TokenType::Word("head".to_string())),
+            Token::new(TokenType::Word("-n1".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let outer = vec![
+            Token::new(TokenType::Word("grep".to_string())),
+            Token::new(TokenType::SubshellExpansion(Some(inner))),
+            Token::new(TokenType::EOF),
+        ];
+        let expected = vec![
+            Token::new(TokenType::SubshellExpansion(Some(outer))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("(grep (ls -a | head -n1) && echo {1..20..2})".to_string());
+        let inner = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-a".to_string())),
+            Token::new(TokenType::Pipe),
+            Token::new(TokenType::Word("head".to_string())),
+            Token::new(TokenType::Word("-n1".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let outer = vec![
+            Token::new(TokenType::Word("grep".to_string())),
+            Token::new(TokenType::SubshellExpansion(Some(inner))),
+            Token::new(TokenType::Ampersand),
+            Token::new(TokenType::Ampersand),
+            Token::new(TokenType::Word("echo".to_string())),
+            Token::new(TokenType::RangeExpressionNumeric(1, 20, Some(2))),
+            Token::new(TokenType::EOF),
+        ];
+        let expected = vec![
+            Token::new(TokenType::SubshellExpansion(Some(outer))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+    }
+
+    #[test]
+    fn variable_expansion() {
+        let scan = Scanner::new("${abc}".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("abc".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("${abc_def}".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("abc_def".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("${_11abc_def}".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("_11abc_def".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("${_1_}".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("_1_".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("$abc".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("abc".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("$abc_def".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("abc_def".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("$_11abc_def".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("_11abc_def".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+
+        let scan = Scanner::new("$_1_".to_string());
+        let expected = vec![
+            Token::new(TokenType::VariableExpansion("_1_".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+    }
+
+    #[test]
+    fn proces_substitution() {
+        let scan = Scanner::new("<(abc)".to_string());
+        let one = vec![
+            Token::new(TokenType::Word("abc".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let expected = vec![
+            Token::new(TokenType::ProcessSubstitution(Some(one))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
+        let scan = Scanner::new(
+            "sort -nr -k 5 <(ls -l /bin) <(ls -l /usr/bin) <(ls -l /sbin)".to_string(),
+        );
+        let one = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-l".to_string())),
+            Token::new(TokenType::Forwardslash),
+            Token::new(TokenType::Word("bin".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let two = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-l".to_string())),
+            Token::new(TokenType::Forwardslash),
+            Token::new(TokenType::Word("usr/bin".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let three = vec![
+            Token::new(TokenType::Word("ls".to_string())),
+            Token::new(TokenType::Word("-l".to_string())),
+            Token::new(TokenType::Forwardslash),
+            Token::new(TokenType::Word("sbin".to_string())),
+            Token::new(TokenType::EOF),
+        ];
+        let expected = vec![
+            Token::new(TokenType::Word("sort".to_string())),
+            Token::new(TokenType::Word("-nr".to_string())),
+            Token::new(TokenType::Word("-k".to_string())),
+            Token::new(TokenType::Integer(5)),
+            Token::new(TokenType::ProcessSubstitution(Some(one))),
+            Token::new(TokenType::ProcessSubstitution(Some(two))),
+            Token::new(TokenType::ProcessSubstitution(Some(three))),
+            Token::new(TokenType::EOF),
+        ];
+        assert_eq!(Some(expected), scan.get_tokens());
     }
 
     /*
-     * awk '{print $1}' data.txt | sort | uniq -c
      * ps aux | grep "[n]ginx"
      * (cd /tmp && touch test.txt && echo "Created file")
      * echo $((2 + 3 * 4))
