@@ -1,375 +1,603 @@
-// Disclaimer: This test suite was written by an LLM
+// HACK: This test suite was written by an LLM
+
 #[cfg(test)]
 mod tests {
-    use crate::parser::{CommandGroup, RedirType};
-
     use std::path::PathBuf;
 
-    fn assert_single_command(group: &CommandGroup, expected_args: &[&str]) {
-        assert_eq!(group.commands.len(), 1, "Expected exactly one command");
+    use super::*;
+    use crate::lexer::*;
+    use crate::parser::*;
+
+    fn parse_command(input: &str) -> Option<Command> {
+        match Command::parse(input) {
+            Ok(s) => Some(s),
+            Err(_) => None,
+        }
+    }
+
+    #[test]
+    fn test_word_parsing() {
+        let input = "echo hello";
+        let command = parse_command(input).expect("Failed to parse command");
+
         assert_eq!(
-            group.commands[0].argv,
-            expected_args.iter().map(|&s| s.to_string()).collect::<Vec<_>>()
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
         );
     }
 
-    fn assert_pipe_chain(group: &CommandGroup, commands: &[&[&str]]) {
-        let mut current = &group.commands[0];
-        for (i, expected_args) in commands.iter().enumerate() {
-            assert_eq!(
-                current.argv,
-                expected_args.iter().map(|&s| s.to_string()).collect::<Vec<_>>(),
-                "Mismatch in command {} of pipe chain", i
-            );
-            
-            if i < commands.len() - 1 {
-                let pipe_to = current.pipe_to.as_ref().expect("Expected pipe to next command");
-                current = &pipe_to.target;
-            } else {
-                assert!(current.pipe_to.is_none(), "Unexpected pipe at end of chain");
-            }
-        }
+    #[test]
+    fn test_subshell_parsing() {
+        let input = "echo $(ls -l)";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Subshell(Command {
+                    argv: vec![Arg::Word("ls".to_string()), Arg::Word("-l".to_string())],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            ]
+        );
     }
 
     #[test]
-    fn test_basic_command() {
-        let group = CommandGroup::parse("ls -la");
-        assert_single_command(&group, &["ls", "-la"]);
+    fn test_variable_parsing() {
+        let input = "echo $HOME";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Variable("HOME".to_string())
+            ]
+        );
     }
 
     #[test]
-    fn test_command_with_numbers() {
-        let group = CommandGroup::parse("echo 123 456");
-        assert_single_command(&group, &["echo", "123", "456"]);
+    fn test_redirection_stdout() {
+        let input = "echo hello > output.txt";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Stdout,
+                target: PathBuf::from("output.txt")
+            }]
+        );
     }
 
     #[test]
-    fn test_quoted_arguments() {
-        let tests = vec![
-            ("echo 'hello world'", vec!["echo", "hello world"]),
-            ("echo \"hello world\"", vec!["echo", "hello world"]),
-            ("echo 'hello\"world'", vec!["echo", "hello\"world"]),
-            ("echo \"hello'world\"", vec!["echo", "hello'world"]),
-            ("echo 'hello\\world'", vec!["echo", "hello\\world"]),
-        ];
+    fn test_redirection_stderr() {
+        let input = "echo hello 2> error.txt";
+        let command = parse_command(input).expect("Failed to parse command");
 
-        for (input, expected) in tests {
-            let group = CommandGroup::parse(input);
-            assert_single_command(&group, &expected);
-        }
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Stderr,
+                target: PathBuf::from("error.txt")
+            }]
+        );
     }
 
     #[test]
-    fn test_mixed_quotes() {
-        let group = CommandGroup::parse("echo 'single' \"double\" normal 'mixed\"quotes'");
-        assert_single_command(&group, &["echo", "single", "double", "normal", "mixed\"quotes"]);
+    fn test_redirection_both() {
+        let input = "echo hello &> output.txt";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Both,
+                target: PathBuf::from("output.txt")
+            }]
+        );
     }
 
     #[test]
-    fn test_simple_pipe() {
-        let group = CommandGroup::parse("ls -l | grep foo");
-        assert_pipe_chain(&group, &[&["ls", "-l"], &["grep", "foo"]]);
-    }
+    fn test_pipe() {
+        let input = "echo hello | grep world";
+        let command = parse_command(input).expect("Failed to parse command");
 
-    #[test]
-    fn test_multiple_pipes() {
-        let group = CommandGroup::parse("cat file.txt | grep error | wc -l");
-        assert_pipe_chain(&group, &[&["cat", "file.txt"], &["grep", "error"], &["wc", "-l"]]);
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.pipe_to,
+            Some(PipeTo {
+                pipe_type: RedirType::Stdout,
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("grep".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            })
+        );
     }
 
     #[test]
     fn test_pipe_both() {
-        let group = CommandGroup::parse("cmd1 |& cmd2");
-        let pipe_to = group.commands[0].pipe_to.as_ref().unwrap();
-        assert!(matches!(pipe_to.pipe_type, RedirType::Both));
-    }
+        let input = "echo hello |& grep world";
+        let command = parse_command(input).expect("Failed to parse command");
 
-    #[test]
-    fn test_stdout_redirection() {
-        let tests = vec![
-            "echo hello > output.txt",
-            "echo hello 1> output.txt",
-            "echo hello >> output.txt",
-            "echo hello 1>> output.txt",
-        ];
-
-        for input in tests {
-            let group = CommandGroup::parse(input);
-            assert_eq!(group.commands[0].argv, vec!["echo", "hello"]);
-            assert_eq!(group.commands[0].redirect_to.len(), 1);
-            assert!(matches!(
-                group.commands[0].redirect_to[0].redirect_type,
-                RedirType::Stdout
-            ));
-            assert_eq!(
-                group.commands[0].redirect_to[0].target,
-                PathBuf::from("output.txt")
-            );
-        }
-    }
-
-    #[test]
-    fn test_stderr_redirection() {
-        let tests = vec![
-            "cmd 2> error.log",
-            "cmd 2>> error.log",
-        ];
-
-        for input in tests {
-            let group = CommandGroup::parse(input);
-            assert_eq!(group.commands[0].argv, vec!["cmd"]);
-            assert_eq!(group.commands[0].redirect_to.len(), 1);
-            assert!(matches!(
-                group.commands[0].redirect_to[0].redirect_type,
-                RedirType::Stderr
-            ));
-            assert_eq!(
-                group.commands[0].redirect_to[0].target,
-                PathBuf::from("error.log")
-            );
-        }
-    }
-
-    #[test]
-    fn test_both_redirection() {
-        let tests = vec!["cmd &> both.log", "cmd &>> both.log"];
-
-        for input in tests {
-            let group = CommandGroup::parse(input);
-            assert_eq!(group.commands[0].argv, vec!["cmd"]);
-            assert_eq!(group.commands[0].redirect_to.len(), 1);
-            assert!(matches!(
-                group.commands[0].redirect_to[0].redirect_type,
-                RedirType::Both
-            ));
-            assert_eq!(
-                group.commands[0].redirect_to[0].target,
-                PathBuf::from("both.log")
-            );
-        }
-    }
-
-    #[test]
-    fn test_multiple_redirections() {
-        let group = CommandGroup::parse("cmd > stdout.log 2> stderr.log");
-        assert_eq!(group.commands[0].argv, vec!["cmd"]);
-        assert_eq!(group.commands[0].redirect_to.len(), 2);
-        
-        assert!(matches!(
-            group.commands[0].redirect_to[0].redirect_type,
-            RedirType::Stdout
-        ));
         assert_eq!(
-            group.commands[0].redirect_to[0].target,
-            PathBuf::from("stdout.log")
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
         );
-        
-        assert!(matches!(
-            group.commands[0].redirect_to[1].redirect_type,
-            RedirType::Stderr
-        ));
+
         assert_eq!(
-            group.commands[0].redirect_to[1].target,
-            PathBuf::from("stderr.log")
+            command.pipe_to,
+            Some(PipeTo {
+                pipe_type: RedirType::Both,
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("grep".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            })
         );
     }
 
     #[test]
-    fn test_complex_commands() {
-        let complex_tests = vec![
-            (
-                "find . -name '*.rs' | xargs grep 'fn main' > output.txt 2> error.log",
-                vec![
-                    vec!["find", ".", "-name", "*.rs"],
-                    vec!["xargs", "grep", "fn main"],
-                ],
-            ),
-            (
-                "cat file.txt | grep -v error |& wc -l > count.txt",
-                vec![
-                    vec!["cat", "file.txt"],
-                    vec!["grep", "-v", "error"],
-                    vec!["wc", "-l"],
-                ],
-            ),
-            (
-                "echo 'Hello, world!' > greeting.txt | cat greeting.txt | tr '[:lower:]' '[:upper:]'",
-                vec![
-                    vec!["echo", "Hello, world!"],
-                    vec!["cat", "greeting.txt"],
-                    vec!["tr", "[:lower:]", "[:upper:]"],
-                ],
-            ),
-        ];
+    fn test_and_then_if() {
+        let input = "echo hello && echo world";
+        let command = parse_command(input).expect("Failed to parse command");
 
-        for (input, expected_commands) in complex_tests {
-            let group = CommandGroup::parse(input);
-            assert_pipe_chain(&group, &expected_commands.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
-        }
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.and_then,
+            Some(AndThen {
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("echo".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                }),
+                conditional: true
+            })
+        );
+    }
+
+    #[test]
+    fn test_and_then() {
+        let input = "echo hello ; echo world";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.and_then,
+            Some(AndThen {
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("echo".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                }),
+                conditional: false
+            })
+        );
     }
 
     #[test]
     fn test_empty_input() {
-        let group = CommandGroup::parse("");
-        assert!(group.commands.is_empty());
-        
-        let group = CommandGroup::parse("   ");
-        assert!(group.commands.is_empty());
+        let input = "";
+        let command = parse_command(input);
+        assert_eq!(command, None);
     }
 
     #[test]
-    fn test_invalid_redirections() {
-        let tests = vec![
-            "cmd >",           // Missing filename
-            "cmd 2>",          // Missing filename
-            "cmd &>",          // Missing filename
-            "cmd > > file",    // Double redirection
-            "cmd 2> > file",   // Invalid redirection syntax
-        ];
-
-        for input in tests {
-            let group = CommandGroup::parse(input);
-            assert!(group.commands.is_empty(), "Expected empty command group for invalid input: {}", input);
-        }
+    fn test_unclosed_subshell() {
+        let input = "echo $(ls -l";
+        let command = parse_command(input);
+        assert_eq!(command, None);
     }
 
     #[test]
-    fn test_whitespace_handling() {
-        let tests = vec![
-            "cmd   arg1    arg2",
-            "\tcmd\targ1\targ2",
-            "cmd \t arg1 \t arg2",
-            "  cmd  arg1  arg2  ",
-        ];
+    fn test_multiple_redirections() {
+        let input = "echo hello > out.txt 2> err.txt";
+        let command = parse_command(input).expect("Failed to parse command");
 
-        for input in tests {
-            let group = CommandGroup::parse(input);
-            assert_single_command(&group, &["cmd", "arg1", "arg2"]);
-        }
-    }
-
-    #[test]
-    fn test_sequential_commands() {
-        let group = CommandGroup::parse("echo hello ; echo world");
-        assert_eq!(group.commands[0].argv, vec!["echo", "hello"]);
-
-        let and_then = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected AndThen");
-        assert!(!and_then.conditional, "Expected non-conditional AndThen");
-        assert_eq!(and_then.target.commands[0].argv, vec!["echo", "world"]);
-    }
-
-    #[test]
-    fn test_conditional_commands() {
-        let group = CommandGroup::parse("test -f file.txt && echo 'file exists'");
-        assert_eq!(group.commands[0].argv, vec!["test", "-f", "file.txt"]);
-
-        let and_then = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected AndThen");
-        assert!(and_then.conditional, "Expected conditional AndThen");
         assert_eq!(
-            and_then.target.commands[0].argv,
-            vec!["echo", "file exists"]
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![
+                FileRedir {
+                    redirect_type: RedirType::Stdout,
+                    target: PathBuf::from("out.txt")
+                },
+                FileRedir {
+                    redirect_type: RedirType::Stderr,
+                    target: PathBuf::from("err.txt")
+                }
+            ]
         );
     }
 
     #[test]
-    fn test_multiple_sequential_commands() {
-        let group = CommandGroup::parse("cmd1 ; cmd2 ; cmd3");
-        assert_eq!(group.commands[0].argv, vec!["cmd1"]);
+    fn test_edge_case_variable_with_special_chars() {
+        let input = "echo $HOME_VAR";
+        let command = parse_command(input).expect("Failed to parse command");
 
-        let and_then1 = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected first AndThen");
-        assert!(!and_then1.conditional);
-        assert_eq!(and_then1.target.commands[0].argv, vec!["cmd2"]);
-
-        let and_then2 = and_then1.target.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected second AndThen");
-        assert!(!and_then2.conditional);
-        assert_eq!(and_then2.target.commands[0].argv, vec!["cmd3"]);
-    }
-
-    #[test]
-    fn test_multiple_conditional_commands() {
-        let group = CommandGroup::parse("test -d dir && cd dir && echo 'changed dir'");
-        assert_eq!(group.commands[0].argv, vec!["test", "-d", "dir"]);
-
-        let and_then1 = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected first AndThen");
-        assert!(and_then1.conditional);
-        assert_eq!(and_then1.target.commands[0].argv, vec!["cd", "dir"]);
-
-        let and_then2 = and_then1.target.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected second AndThen");
-        assert!(and_then2.conditional);
         assert_eq!(
-            and_then2.target.commands[0].argv,
-            vec!["echo", "changed dir"]
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Variable("HOME_VAR".to_string())
+            ]
         );
     }
 
     #[test]
-    fn test_mixed_conditional_and_sequential() {
-        let group = CommandGroup::parse("mkdir dir && cd dir ; echo 'done'");
-        assert_eq!(group.commands[0].argv, vec!["mkdir", "dir"]);
-
-        let and_then1 = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected first AndThen");
-        assert!(and_then1.conditional);
-        assert_eq!(and_then1.target.commands[0].argv, vec!["cd", "dir"]);
-
-        let and_then2 = and_then1.target.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected second AndThen");
-        assert!(!and_then2.conditional);
-        assert_eq!(and_then2.target.commands[0].argv, vec!["echo", "done"]);
+    fn test_invalid_variable() {
+        let input = "echo $1invalidVar";
+        let command = parse_command(input);
+        assert_eq!(command, None);
     }
 
     #[test]
-    fn test_and_then_with_redirections() {
-        let group = CommandGroup::parse("echo 'log entry' > log.txt && cat log.txt");
-        assert_eq!(group.commands[0].argv, vec!["echo", "log entry"]);
+    fn test_empty_word() {
+        let input = "echo ";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(command.argv, vec![Arg::Word("echo".to_string())]);
+        assert!(command.pipe_to.is_none());
+        assert!(command.redirect_to.is_empty());
+    }
+
+    #[test]
+    fn test_multiple_spaces_between_words() {
+        let input = "echo    hello   world";
+        let command = parse_command(input).expect("Failed to parse command");
+
         assert_eq!(
-            group.commands[0].redirect_to[0].target.to_str().unwrap(),
-            "log.txt"
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string()),
+                Arg::Word("world".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multiple_redirections_same_type() {
+        let input = "echo hello > output.txt > another_output.txt";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
         );
 
-        let and_then = group.commands[0]
-            .and_then
-            .as_ref()
-            .expect("Expected AndThen");
-        assert!(and_then.conditional);
-        assert_eq!(and_then.target.commands[0].argv, vec!["cat", "log.txt"]);
+        assert_eq!(
+            command.redirect_to,
+            vec![
+                FileRedir {
+                    redirect_type: RedirType::Stdout,
+                    target: PathBuf::from("output.txt")
+                },
+                FileRedir {
+                    redirect_type: RedirType::Stdout,
+                    target: PathBuf::from("another_output.txt")
+                }
+            ]
+        );
     }
 
     #[test]
-    fn test_and_then_with_pipes() {
-        let group = CommandGroup::parse("cat file.txt | grep error && echo 'found error'");
-        assert_eq!(group.commands[0].argv, vec!["cat", "file.txt"]);
+    fn test_redirection_with_pipe() {
+        let input = "echo hello > output.txt | grep world";
+        let command = parse_command(input).expect("Failed to parse command");
 
-        let pipe_to = group.commands[0].pipe_to.as_ref().expect("Expected pipe");
-        assert_eq!(pipe_to.target.argv, vec!["grep", "error"]);
-
-        let and_then = pipe_to.target.and_then.as_ref().expect("Expected AndThen");
-        assert!(and_then.conditional);
         assert_eq!(
-            and_then.target.commands[0].argv,
-            vec!["echo", "found error"]
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Stdout,
+                target: PathBuf::from("output.txt")
+            }]
+        );
+
+        assert_eq!(
+            command.pipe_to,
+            Some(PipeTo {
+                pipe_type: RedirType::Stdout,
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("grep".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            })
+        );
+    }
+
+    #[test]
+    fn test_redirection_with_and_then() {
+        let input = "echo hello > output.txt && echo world";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Stdout,
+                target: PathBuf::from("output.txt")
+            }]
+        );
+
+        assert_eq!(
+            command.and_then,
+            Some(AndThen {
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("echo".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                }),
+                conditional: true
+            })
+        );
+    }
+
+    #[test]
+    fn test_variable_in_subshell() {
+        let input = "echo $(echo $USER)";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Subshell(Command {
+                    argv: vec![
+                        Arg::Word("echo".to_string()),
+                        Arg::Variable("USER".to_string())
+                    ],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            ]
+        );
+    }
+
+    #[test]
+    fn test_subshell_with_redirection() {
+        let input = "echo $(ls) > output.txt";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Subshell(Command {
+                    argv: vec![Arg::Word("ls".to_string())],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            ]
+        );
+
+        assert_eq!(
+            command.redirect_to,
+            vec![FileRedir {
+                redirect_type: RedirType::Stdout,
+                target: PathBuf::from("output.txt")
+            }]
+        );
+    }
+
+    #[test]
+    fn test_unclosed_quotes() {
+        let input = "echo \"hello";
+        let command = parse_command(input);
+        assert_eq!(command, None);
+    }
+
+    #[test]
+    fn test_subshell_missing_closing_paren() {
+        let input = "echo $(ls";
+        let command = parse_command(input);
+        assert_eq!(command, None);
+    }
+
+    #[test]
+    fn test_and_then_with_pipe() {
+        let input = "echo hello && echo world | grep test";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.and_then,
+            Some(AndThen {
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("echo".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: Some(PipeTo {
+                        pipe_type: RedirType::Stdout,
+                        target: Box::new(Command {
+                            argv: vec![
+                                Arg::Word("grep".to_string()),
+                                Arg::Word("test".to_string())
+                            ],
+                            pipe_to: None,
+                            redirect_to: Vec::new(),
+                            and_then: None,
+                        })
+                    }),
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                }),
+                conditional: true
+            })
+        );
+    }
+
+    #[test]
+    fn test_pipe_with_multiple_commands() {
+        let input = "echo hello | grep world | sort";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Word("hello".to_string())
+            ]
+        );
+
+        assert_eq!(
+            command.pipe_to,
+            Some(PipeTo {
+                pipe_type: RedirType::Stdout,
+                target: Box::new(Command {
+                    argv: vec![
+                        Arg::Word("grep".to_string()),
+                        Arg::Word("world".to_string())
+                    ],
+                    pipe_to: Some(PipeTo {
+                        pipe_type: RedirType::Stdout,
+                        target: Box::new(Command {
+                            argv: vec![Arg::Word("sort".to_string())],
+                            pipe_to: None,
+                            redirect_to: Vec::new(),
+                            and_then: None,
+                        })
+                    }),
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            })
+        );
+    }
+
+    #[test]
+    fn test_empty_subshell() {
+        let input = "echo $(echo)";
+        let command = parse_command(input).expect("Failed to parse command");
+
+        assert_eq!(
+            command.argv,
+            vec![
+                Arg::Word("echo".to_string()),
+                Arg::Subshell(Command {
+                    argv: vec![Arg::Word("echo".to_string())],
+                    pipe_to: None,
+                    redirect_to: Vec::new(),
+                    and_then: None,
+                })
+            ]
         );
     }
 }

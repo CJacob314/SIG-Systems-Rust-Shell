@@ -1,9 +1,16 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
-#[derive(Debug, Clone)]
+use crate::parser::ParseError;
+
+#[derive(Debug)]
+struct UnmatchedDelimiterError;
+
+#[derive(Debug)]
 pub enum Token {
     Word(String),
+    SubShell(String),
+    Variable(String),
     Pipe,
     PipeBoth,
     RedirOut,
@@ -28,7 +35,7 @@ impl<'a> Lexer<'a> {
         while self.chars.next_if(|c| c.is_whitespace()).is_some() {}
     }
 
-    fn lex_word(&mut self) -> Option<Token> {
+    fn lex_word(&mut self) -> Result<Token, ParseError> {
         let mut word = String::new();
         let mut in_single_quotes = false;
         let mut in_double_quotes = false;
@@ -56,7 +63,7 @@ impl<'a> Lexer<'a> {
             } else if c == '"' {
                 self.chars.next();
                 in_double_quotes = true;
-            } else if c == '>' || c == '&' {
+            } else if c == ';' || c == '>' || c == '&' {
                 break;
             } else if c.is_ascii_digit()
                 && self
@@ -73,10 +80,14 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        if in_single_quotes || in_double_quotes {
+            return Err(ParseError::UnterminatedStringLiteral);
+        }
+
         if !word.is_empty() {
-            Some(Token::Word(word))
+            Ok(Token::Word(word))
         } else {
-            None
+            Err(ParseError::NotFound)
         }
     }
 
@@ -179,26 +190,133 @@ impl<'a> Lexer<'a> {
         }
         None
     }
+
+    // add a custom error type maybe
+    fn subshell_inner(&mut self) -> Result<String, ParseError> {
+        let mut inner_string = String::new();
+        let mut open_parens = 1;
+        let mut matched = false;
+
+        // We don't want that first '('
+        self.chars.next();
+
+        while let Some(&c) = self.chars.peek() {
+            match c {
+                ')' => {
+                    if open_parens == 0 {
+                        break;
+                    } else if open_parens == 1 {
+                        self.chars.next();
+                        matched = true;
+                        break;
+                    } else {
+                        open_parens -= 1;
+                    }
+                }
+                '(' => {
+                    open_parens += 1;
+                }
+                _ => {}
+            }
+            self.chars.next();
+            inner_string.push(c);
+        }
+        if matched {
+            Ok(inner_string)
+        } else {
+            Err(ParseError::UnmatchedDelimiterError)
+        }
+    }
+
+    fn lex_subshell(&mut self) -> Result<Token, ParseError> {
+        let mut iter = self.chars.clone();
+
+        if let Some(c) = iter.next() {
+            if c == '$' {
+                if let Some(&next_c) = iter.peek() {
+                    if next_c == '(' {
+                        self.chars.next();
+                        let inner_string = self.subshell_inner()?;
+                        return Ok(Token::SubShell(inner_string));
+                    }
+                }
+            } else if c == '(' {
+                let inner_string = self.subshell_inner()?;
+                return Ok(Token::SubShell(inner_string));
+            }
+        }
+        Err(ParseError::NotFound)
+    }
+
+    /*
+     * name -  A  word  consisting  only  of alphanumeric characters and underscores,
+     *         and beginning with an alphabetic character or an  underscore.  Also
+     *         referred to as an identifier
+     */
+
+    fn lex_variable(&mut self) -> Result<Token, ParseError> {
+        if let Some(&c) = self.chars.peek() {
+            if c == '$' {
+                self.chars.next();
+
+                if !self
+                    .chars
+                    .peek()
+                    .is_some_and(|&ch| ch.is_alphabetic() || ch == '_')
+                {
+                    return Err(ParseError::InvalidVariable);
+                }
+
+                let variable_name: String = self
+                    .chars
+                    .clone()
+                    .take_while(|&ch| ch.is_alphanumeric() || ch == '_')
+                    .collect();
+
+                for _ in 0..variable_name.len() {
+                    self.chars.next();
+                }
+                return Ok(Token::Variable(variable_name));
+            }
+        }
+        Err(ParseError::NotFound)
+    }
 }
 
 impl Iterator for Lexer<'_> {
-    type Item = Token;
+    type Item = Result<Token, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.skip_whitespace();
 
         if let Some(token) = self.lex_redirection() {
-            return Some(token);
+            return Some(Ok(token));
         }
 
         if let Some(token) = self.lex_pipe() {
-            return Some(token);
+            return Some(Ok(token));
         }
 
         if let Some(token) = self.lex_and_then() {
-            return Some(token);
+            return Some(Ok(token));
         }
 
-        self.lex_word()
+        match self.lex_subshell() {
+            Ok(token) => return Some(Ok(token)),
+            Err(ParseError::NotFound) => (),
+            Err(e) => return Some(Err(e)),
+        }
+
+        match self.lex_variable() {
+            Ok(token) => return Some(Ok(token)),
+            Err(ParseError::NotFound) => (),
+            Err(e) => return Some(Err(e)),
+        }
+
+        match self.lex_word() {
+            Ok(token) => return Some(Ok(token)),
+            Err(ParseError::NotFound) => None,
+            Err(e) => return Some(Err(e)),
+        }
     }
 }

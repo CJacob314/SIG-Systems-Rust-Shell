@@ -4,9 +4,10 @@ mod parser;
 #[cfg(test)]
 mod tests;
 
+use libc::{execle, execve, fork};
 use std::io::{self, Write};
 
-use parser::CommandGroup;
+use parser::Command;
 
 fn main() {
     // Input REPL loop
@@ -24,7 +25,7 @@ fn main() {
             break;
         }
 
-        let command_group = CommandGroup::parse(input);
-        println!("{command_group:#?}");
+        let command = Command::parse(input);
+        println!("{command:#?}");
     }
 }
